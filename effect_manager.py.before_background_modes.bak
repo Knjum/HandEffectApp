@@ -1,0 +1,62 @@
+"""
+effect_manager.py
+Quản lý tất cả hiệu ứng: nhận cử chỉ kích hoạt, gọi hiệu ứng tương ứng,
+cập nhật và vẽ chúng lên mỗi khung hình theo đúng thứ tự lớp (layer).
+"""
+
+import config
+from effects import ALL_EFFECTS
+
+
+class EffectManager:
+    def __init__(self):
+        self.effects = [cls() for cls in ALL_EFFECTS]        # Thứ tự = phím tắt 1, 2, 3...
+        self.by_name = {e.name: e for e in self.effects}
+        # Thứ tự vẽ: layer nhỏ vẽ trước (nền), layer lớn vẽ sau (ánh sáng, hạt)
+        self.draw_order = sorted(self.effects, key=lambda e: e.layer)
+        self.last_time = None
+
+    def needs_body(self):
+        """Có hiệu ứng nào đang bật và cần tách người khỏi nền không?"""
+        return any(e.enabled and e.needs_body for e in self.effects)
+
+    def process(self, frame, hands, gesture_result, now, body=None):
+        """
+        Gọi mỗi khung hình. Trả về ảnh đã có hiệu ứng.
+        body: BodyAnalyzer (hoặc None nếu không có nhận diện cơ thể).
+        """
+        dt = 0.0 if self.last_time is None else min(now - self.last_time, 0.1)
+        self.last_time = now
+
+        h, w = frame.shape[:2]
+        size = (w, h)
+
+        # 1. Cử chỉ vừa kích hoạt -> bật các hiệu ứng được gắn với nó
+        for _key, gesture in gesture_result.triggered:
+            for effect_name in config.GESTURE_EFFECTS.get(gesture, []):
+                effect = self.by_name.get(effect_name)
+                if effect is not None and effect.enabled:
+                    effect.trigger(now, hands, size)
+
+        # 2. Cập nhật và vẽ từng hiệu ứng theo thứ tự lớp
+        for effect in self.draw_order:
+            if effect.enabled:
+                effect.body = body
+                effect.update(dt, now, hands, size)
+                frame = effect.draw(frame, now)
+        return frame
+
+    def toggle(self, index):
+        """Bật/tắt hiệu ứng thứ index (0, 1, 2...). Tắt thì xóa sạch hình đang hiển thị."""
+        if 0 <= index < len(self.effects):
+            effect = self.effects[index]
+            effect.enabled = not effect.enabled
+            if not effect.enabled:
+                effect.clear()
+
+    def change_intensity(self, delta):
+        """Tăng/giảm độ mạnh của tất cả hiệu ứng."""
+        for effect in self.effects:
+            value = effect.intensity + delta
+            effect.intensity = max(config.EFFECT_MIN_INTENSITY,
+                                   min(config.EFFECT_MAX_INTENSITY, value))

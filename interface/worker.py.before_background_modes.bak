@@ -1,0 +1,278 @@
+"""
+interface/worker.py
+Luồng nền xử lý video: camera -> bàn tay -> cử chỉ -> cơ thể -> hiệu ứng -> camera ảo.
+Giao tiếp với giao diện bằng:
+  - Signal (gửi ra):  frame_ready, status_changed, error, warning, vcam_state
+  - send() (nhận vào): hàng đợi lệnh từ giao diện
+"""
+
+import queue
+import time
+import traceback
+
+import cv2
+from PySide6.QtCore import QThread, Signal
+from PySide6.QtGui import QImage
+
+import config
+from camera import Camera, CameraError
+from hand_detection import HandDetector
+from gesture_recognition import GestureRecognizer
+from effect_manager import EffectManager
+from body_detection import BodyAnalyzer
+
+# pyvirtualcam là tùy chọn: chưa cài thì app vẫn chạy, chỉ không có camera ảo
+try:
+    import pyvirtualcam
+except ImportError:
+    pyvirtualcam = None
+
+# Chỉ cho phép giao diện đổi những thiết lập này (an toàn)
+ALLOWED_CONFIG = {
+    "MIRROR_VIEW", "SHOW_HAND_LANDMARKS", "SHOW_POSE", "VCAM_MIRROR",
+    "DISAPPEAR_BACKGROUND_IMAGE_PATH",
+}
+
+STATUS_INTERVAL = 0.2   # Gửi trạng thái lên giao diện 5 lần mỗi giây là đủ
+
+
+class VideoWorker(QThread):
+    frame_ready = Signal(QImage)       # Khung hình xem trước
+    status_changed = Signal(object)    # dict: fps, hands, gestures, running, coverage
+    error = Signal(str)                # Lỗi nghiêm trọng (camera...) -> luồng sẽ dừng
+    warning = Signal(str)              # Cảnh báo nhẹ, chương trình vẫn chạy
+    vcam_state = Signal(bool, str)     # (đang xuất?, nội dung). Tắt bình thường: (False, "")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._stop_flag = False
+        self._commands = queue.Queue()   # Hàng đợi lệnh an toàn giữa các luồng
+        self._display_ready = True       # Giao diện đã vẽ xong khung trước chưa?
+        self._last_hands = []
+        self._last_size = (0, 0)
+
+        # Camera ảo (chỉ được đụng vào từ luồng nền)
+        self._vcam = None                # Đối tượng pyvirtualcam.Camera (None = chưa mở)
+        self._vcam_wanted = False        # Người dùng có muốn xuất camera ảo không
+        self._vcam_size = (0, 0)
+
+    # ------------------------------------------------------------------
+    # Các hàm được GIAO DIỆN gọi (chạy ở luồng giao diện)
+    # ------------------------------------------------------------------
+    def send(self, *command):
+        """Gửi một lệnh sang luồng nền, ví dụ send('effect', 'hearts', 'enabled', True)."""
+        self._commands.put(command)
+
+    def stop(self):
+        self._stop_flag = True
+
+    def display_done(self):
+        """Giao diện báo đã vẽ xong khung hình. Tránh dồn khung khi giao diện chậm."""
+        self._display_ready = True
+
+    # ------------------------------------------------------------------
+    # Xử lý lệnh (chạy ở luồng nền)
+    # ------------------------------------------------------------------
+    def _handle_commands(self, manager, body):
+        while True:
+            try:
+                cmd = self._commands.get_nowait()
+            except queue.Empty:
+                return
+
+            kind = cmd[0]
+            if kind == "effect":                       # ("effect", tên, thuộc tính, giá trị)
+                _, name, key, value = cmd
+                effect = manager.by_name.get(name)
+                if effect is None:
+                    continue
+                if key == "enabled":
+                    effect.enabled = bool(value)
+                    if not effect.enabled:
+                        effect.clear()
+                elif key == "intensity":
+                    effect.intensity = float(value)
+                elif key == "duration":
+                    effect.duration = float(value)
+
+            elif kind == "config":                     # ("config", tên thiết lập, giá trị)
+                _, attr, value = cmd
+                if attr in ALLOWED_CONFIG:
+                    setattr(config, attr, value)
+
+            elif kind == "reset_plate":
+                if body is not None:
+                    body.plate.reset()
+
+            elif kind == "trigger":
+                effect = manager.by_name.get(cmd[1])
+                if effect is not None and effect.enabled:
+                    effect.trigger(time.time(), self._last_hands, self._last_size)
+
+            elif kind == "vcam":                       # ("vcam", True/False)
+                self._vcam_wanted = bool(cmd[1])
+
+    @staticmethod
+    def _to_qimage(frame):
+        """Chuyển ảnh OpenCV (BGR) sang QImage (RGB) của Qt."""
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        return QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
+
+    # ------------------------------------------------------------------
+    # CAMERA ẢO
+    # ------------------------------------------------------------------
+    def _open_vcam(self, width, height):
+        """Mở camera ảo với đúng kích thước khung hình. Lỗi thì báo giao diện, không làm app chết."""
+        if pyvirtualcam is None:
+            self._vcam_wanted = False
+            self.vcam_state.emit(
+                False,
+                "Chưa cài thư viện pyvirtualcam.\nHãy chạy lệnh:  pip install pyvirtualcam")
+            return
+        try:
+            self._vcam = pyvirtualcam.Camera(
+                width=width, height=height, fps=config.VCAM_FPS,
+                fmt=pyvirtualcam.PixelFormat.BGR,      # Cùng định dạng màu với OpenCV
+            )
+            self._vcam_size = (width, height)
+            self.vcam_state.emit(True, str(self._vcam.device))
+        except Exception as e:
+            self._vcam = None
+            self._vcam_wanted = False
+            self.vcam_state.emit(
+                False,
+                "Không mở được camera ảo.\n\n"
+                "Hãy kiểm tra:\n"
+                "1. Đã cài OBS Studio chưa?\n"
+                "2. OBS có đang bật 'Start Virtual Camera' không? (phải TẮT nó đi)\n"
+                "3. Có app nào khác đang giữ camera ảo không?\n\n"
+                f"Chi tiết: {e}")
+
+    def _close_vcam(self):
+        if self._vcam is not None:
+            try:
+                self._vcam.close()
+            except Exception:
+                pass
+            self._vcam = None
+
+    def _send_vcam(self, frame):
+        """Gửi một khung hình ra camera ảo (mở/đóng camera ảo theo ý người dùng)."""
+        h, w = frame.shape[:2]
+
+        if self._vcam_wanted and self._vcam is None:
+            self._open_vcam(w, h)
+        elif not self._vcam_wanted and self._vcam is not None:
+            self._close_vcam()
+            self.vcam_state.emit(False, "")
+        if self._vcam is None:
+            return
+
+        # Camera ảo có kích thước cố định, ảnh gửi vào phải khớp chính xác
+        if (w, h) != self._vcam_size:
+            return
+
+        try:
+            # Ảnh hiện đang ở trạng thái "lật gương" = MIRROR_VIEW.
+            # Muốn gửi đi ở trạng thái VCAM_MIRROR, nếu hai giá trị khác nhau thì lật lại.
+            out = cv2.flip(frame, 1) if config.MIRROR_VIEW != config.VCAM_MIRROR else frame
+            self._vcam.send(out)
+        except Exception as e:
+            # Ví dụ: driver bị gỡ, OBS chiếm camera ảo giữa chừng
+            self._close_vcam()
+            self._vcam_wanted = False
+            self.vcam_state.emit(False, f"Camera ảo bị gián đoạn: {e}")
+
+    # ------------------------------------------------------------------
+    # Vòng lặp chính (chạy ở luồng nền, khởi động bằng .start())
+    # ------------------------------------------------------------------
+    def run(self):
+        camera = Camera()
+        detector = None
+        body = None
+
+        try:
+            camera.open()
+            detector = HandDetector()
+            try:
+                body = BodyAnalyzer()
+            except Exception as e:
+                self.warning.emit(f"Không khởi tạo được nhận diện cơ thể.\n"
+                                  f"Các hiệu ứng về nền sẽ không hoạt động.\n\n{e}")
+            recognizer = GestureRecognizer()
+            manager = EffectManager()
+
+            prev_time = time.time()
+            last_status = 0.0
+            fps = 0.0
+
+            while not self._stop_flag:
+                self._handle_commands(manager, body)
+
+                frame = camera.read()
+                if frame is None:
+                    self.msleep(5)
+                    continue
+
+                if config.MIRROR_VIEW:
+                    frame = cv2.flip(frame, 1)
+
+                # 1. Bàn tay + cử chỉ
+                hands = detector.detect(frame)
+                now = time.time()
+                result = recognizer.update(hands, now)
+                self._last_hands = hands
+                self._last_size = (frame.shape[1], frame.shape[0])
+
+                # 2. Cơ thể
+                if body is not None:
+                    body.update(frame, manager.needs_body())
+
+                # 3. Hiệu ứng -> ẢNH SẠCH
+                frame = manager.process(frame, hands, result, now, body)
+
+                # 4. Gửi ảnh sạch ra camera ảo (TRƯỚC khi vẽ bộ xương)
+                self._send_vcam(frame)
+
+                # 5. Chỉ để xem trước: bây giờ mới vẽ bộ xương lên
+                if config.SHOW_HAND_LANDMARKS:
+                    detector.draw(frame, hands)
+                if body is not None and config.SHOW_POSE:
+                    body.draw_pose(frame)
+
+                # 6. Gửi khung xem trước lên giao diện
+                if self._display_ready:
+                    self._display_ready = False
+                    self.frame_ready.emit(self._to_qimage(frame))
+
+                # 7. Gửi trạng thái
+                instant = 1.0 / max(now - prev_time, 1e-6)
+                fps = 0.9 * fps + 0.1 * instant
+                prev_time = now
+                if now - last_status >= STATUS_INTERVAL:
+                    last_status = now
+                    coverage = None
+                    if body is not None and body.mask is not None:
+                        coverage = body.plate.coverage()
+                    self.status_changed.emit({
+                        "fps": fps,
+                        "hands": len(hands),
+                        "gestures": dict(result.active),
+                        "running": [e.name for e in manager.effects
+                                    if e.enabled and e.is_running(now)],
+                        "coverage": coverage,
+                    })
+
+        except CameraError as e:
+            self.error.emit(str(e))
+        except Exception:
+            self.error.emit("Lỗi không mong muốn:\n\n" + traceback.format_exc())
+        finally:
+            # Luôn giải phóng tài nguyên, kể cả camera ảo
+            self._close_vcam()
+            if detector is not None:
+                detector.close()
+            if body is not None:
+                body.close()
+            camera.close()
